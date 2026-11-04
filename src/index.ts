@@ -5,13 +5,17 @@ import { ContentfulStatusCode } from "hono/utils/http-status";
 import { DummyEndpoint } from "./endpoints/dummyEndpoint";
 import { cors } from "hono/cors";
 
-// Start a Hono app
-const app = new Hono<{ Bindings: Env }>();
+type AppEnv = Env & {
+  SUPABASE_URL: string;
+  SUPABASE_PUBLISHABLE_KEY: string;
+};
+
+const app = new Hono<{ Bindings: AppEnv }>();
 
 app.use("/api/*", cors({
   origin: "https://playbox.gearshaft01.workers.dev",
   allowMethods: ["GET", "OPTIONS"],
-  allowHeaders: ["Content-Type"],
+  allowHeaders: ["Content-Type", "Authorization",],
 }));
 
 app.onError((err, c) => {
@@ -102,6 +106,50 @@ app.get("/api/games/:id", async (c) => {
   }
 
   return c.json({ game });
+});
+
+app.get("/api/me", async (c) => {
+  const authorization = c.req.header("Authorization");
+  const token = authorization?.match(/^Bearer\s+(.+)$/i)?.[1];
+
+  if (!token) {
+    return c.json({ error: "Sign-in required" }, 401);
+  }
+
+  if (!c.env.SUPABASE_URL || !c.env.SUPABASE_PUBLISHABLE_KEY) {
+    return c.json({ error: "Authentication is not configured" }, 503);
+  }
+
+  const authResponse = await fetch(
+    `${c.env.SUPABASE_URL.replace(/\/$/, "")}/auth/v1/user`,
+    {
+      headers: {
+        apikey: c.env.SUPABASE_PUBLISHABLE_KEY,
+        Authorization: `Bearer ${token}`,
+      },
+    }
+  );
+
+  if (authResponse.status === 401 || authResponse.status === 403) {
+    return c.json({ error: "Invalid or expired sign-in" }, 401);
+  }
+
+  if (!authResponse.ok) {
+    return c.json({ error: "Could not verify sign-in" }, 502);
+  }
+
+  const user: { id?: unknown; email?: unknown } = await authResponse.json();
+
+  if (typeof user.id !== "string") {
+    return c.json({ error: "Invalid sign-in response" }, 502);
+  }
+
+  return c.json({
+    user: {
+      id: user.id,
+      email: typeof user.email === "string" ? user.email : null,
+    },
+  });
 });
 
 // Export the Hono app

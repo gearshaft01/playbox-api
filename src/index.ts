@@ -76,7 +76,10 @@ async function verifyModerator(request: Request, env: AppEnv): Promise<AuthResul
 }
 
 app.use("/api/*", cors({
-  origin: "https://playbox.gearshaft01.workers.dev",
+  origin: [
+  "https://playbox.gearshaft01.workers.dev",
+  "https://playbox-blond.vercel.app",
+	],
   allowMethods: ["GET", "OPTIONS", "POST"],
   allowHeaders: ["Content-Type", "Authorization",],
 }));

@@ -4,13 +4,76 @@ import { tasksRouter } from "./endpoints/tasks/router";
 import { ContentfulStatusCode } from "hono/utils/http-status";
 import { DummyEndpoint } from "./endpoints/dummyEndpoint";
 import { cors } from "hono/cors";
+import { Hono, type Context } from "hono";
 
 type AppEnv = Env & {
   SUPABASE_URL: string;
   SUPABASE_PUBLISHABLE_KEY: string;
+  MODERATOR_USER_ID: string;
 };
 
 const app = new Hono<{ Bindings: AppEnv }>();
+
+type VerifiedUser = {
+  id: string;
+  email: string | null;
+};
+
+type AuthResult =
+  | { ok: true; user: VerifiedUser }
+  | { ok: false; response: Response };
+
+async function verifyUser(
+  request: Request,
+  env: AppEnv,
+): Promise<AuthResult> {
+  const token = request.headers.get("Authorization")?.match(/^Bearer\s+(.+)$/i)?.[1];
+  if (!token) {
+    return { ok: false, response: Response.json({ error: "Sign-in required" }, { status: 401 }) };
+  }
+
+  if (!env.SUPABASE_URL || !env.SUPABASE_PUBLISHABLE_KEY) {
+    return { ok: false, response: Response.json({ error: "Authentication is not configured" }, { status: 503 }) };
+  }
+
+  const authResponse = await fetch(`${env.SUPABASE_URL.replace(/\/$/, "")}/auth/v1/user`, {
+    headers: {
+      apikey: env.SUPABASE_PUBLISHABLE_KEY,
+      Authorization: `Bearer ${token}`,
+    },
+  });
+
+  if (authResponse.status === 401 || authResponse.status === 403) {
+    return { ok: false, response: Response.json({ error: "Invalid or expired sign-in" }, { status: 401 }) };
+  }
+  if (!authResponse.ok) {
+    return { ok: false, response: Response.json({ error: "Could not verify sign-in" }, { status: 502 }) };
+  }
+
+  const user: { id?: unknown; email?: unknown } = await authResponse.json();
+  if (typeof user.id !== "string") {
+    return { ok: false, response: Response.json({ error: "Invalid sign-in response" }, { status: 502 }) };
+  }
+
+  return {
+    ok: true,
+    user: { id: user.id, email: typeof user.email === "string" ? user.email : null },
+  };
+}
+
+async function verifyModerator(request: Request, env: AppEnv): Promise<AuthResult> {
+  const result = await verifyUser(request, env);
+  if (!result.ok) return result;
+
+  if (!env.MODERATOR_USER_ID) {
+    return { ok: false, response: Response.json({ error: "Moderator is not configured" }, { status: 503 }) };
+  }
+  if (result.user.id !== env.MODERATOR_USER_ID) {
+    return { ok: false, response: Response.json({ error: "Moderator access required" }, { status: 403 }) };
+  }
+
+  return result;
+}
 
 app.use("/api/*", cors({
   origin: "https://playbox.gearshaft01.workers.dev",
@@ -228,6 +291,81 @@ app.post("/api/games", async (c) => {
   ]);
 
   return c.json({ id, status: "pending" }, 201);
+});
+
+app.get("/api/moderation/pending", async (c) => {
+  const auth = await verifyModerator(c.req.raw, c.env);
+  if (!auth.ok) return auth.response;
+
+  const result = await c.env.DB.prepare(`
+    SELECT
+      g.id AS game_id,
+      g.owner_id AS author,
+      v.version_number,
+      v.title,
+      v.description,
+      v.color,
+      v.html,
+      v.css,
+      v.js
+    FROM game_versions AS v
+    JOIN games AS g ON g.id = v.game_id
+    WHERE v.status = 'pending'
+    ORDER BY v.created_at ASC
+  `).all();
+
+  return c.json({ games: result.results });
+});
+
+app.post("/api/moderation/games/:id/versions/:versionNumber", async (c) => {
+  const auth = await verifyModerator(c.req.raw, c.env);
+  if (!auth.ok) return auth.response;
+
+  const versionNumber = Number(c.req.param("versionNumber"));
+  if (!Number.isSafeInteger(versionNumber) || versionNumber < 1) {
+    return c.json({ error: "Invalid version number" }, 400);
+  }
+
+  let body: unknown;
+  try {
+    body = await c.req.json();
+  } catch {
+    return c.json({ error: "Invalid JSON body" }, 400);
+  }
+
+  if (!body || typeof body !== "object") {
+    return c.json({ error: "Invalid review decision" }, 400);
+  }
+
+  const decision = body as Record<string, unknown>;
+  if (decision.status !== "approved" && decision.status !== "rejected") {
+    return c.json({ error: "Status must be approved or rejected" }, 400);
+  }
+
+  const reason = typeof decision.reason === "string" ? decision.reason.trim() : "";
+  if (decision.status === "rejected" && !reason) {
+    return c.json({ error: "A reason is required to reject a game" }, 400);
+  }
+  if (reason.length > 500) {
+    return c.json({ error: "Reason must be at most 500 characters" }, 400);
+  }
+
+  const result = await c.env.DB.prepare(`
+    UPDATE game_versions
+    SET status = ?, review_reason = ?
+    WHERE game_id = ? AND version_number = ? AND status = 'pending'
+  `).bind(
+    decision.status,
+    decision.status === "rejected" ? reason : "",
+    c.req.param("id"),
+    versionNumber,
+  ).run();
+
+  if (result.meta.changes === 0) {
+    return c.json({ error: "Pending game version not found" }, 404);
+  }
+
+  return c.json({ success: true });
 });
 
 // Export the Hono app

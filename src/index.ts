@@ -14,7 +14,7 @@ const app = new Hono<{ Bindings: AppEnv }>();
 
 app.use("/api/*", cors({
   origin: "https://playbox.gearshaft01.workers.dev",
-  allowMethods: ["GET", "OPTIONS"],
+  allowMethods: ["GET", "OPTIONS", "POST"],
   allowHeaders: ["Content-Type", "Authorization",],
 }));
 
@@ -150,6 +150,84 @@ app.get("/api/me", async (c) => {
       email: typeof user.email === "string" ? user.email : null,
     },
   });
+});
+
+app.post("/api/games", async (c) => {
+  const token = c.req.header("Authorization")?.match(/^Bearer\s+(.+)$/i)?.[1];
+  if (!token) return c.json({ error: "Sign-in required" }, 401);
+
+  const authResponse = await fetch(
+    `${c.env.SUPABASE_URL.replace(/\/$/, "")}/auth/v1/user`,
+    {
+      headers: {
+        apikey: c.env.SUPABASE_PUBLISHABLE_KEY,
+        Authorization: `Bearer ${token}`,
+      },
+    }
+  );
+
+  if (authResponse.status === 401 || authResponse.status === 403) {
+    return c.json({ error: "Invalid or expired sign-in" }, 401);
+  }
+  if (!authResponse.ok) {
+    return c.json({ error: "Could not verify sign-in" }, 502);
+  }
+
+  const user: { id?: unknown } = await authResponse.json();
+  if (typeof user.id !== "string") {
+    return c.json({ error: "Invalid sign-in response" }, 502);
+  }
+
+  let body: unknown;
+  try {
+    body = await c.req.json();
+  } catch {
+    return c.json({ error: "Invalid JSON body" }, 400);
+  }
+
+  if (!body || typeof body !== "object") {
+    return c.json({ error: "Invalid game data" }, 400);
+  }
+
+  const game = body as Record<string, unknown>;
+  const fields = ["title", "description", "color", "html", "css", "js"];
+  if (fields.some((field) => typeof game[field] !== "string")) {
+    return c.json({ error: "All game fields must be strings" }, 400);
+  }
+
+  const title = game.title as string;
+  const description = game.description as string;
+  const color = game.color as string;
+  const html = game.html as string;
+  const css = game.css as string;
+  const js = game.js as string;
+
+  if (!title.trim() || title.length > 100) {
+    return c.json({ error: "Title is required and must be at most 100 characters" }, 400);
+  }
+  if (description.length > 500) {
+    return c.json({ error: "Description must be at most 500 characters" }, 400);
+  }
+  if (!/^#[0-9a-f]{6}$/i.test(color)) {
+    return c.json({ error: "Invalid thumbnail color" }, 400);
+  }
+  if (new TextEncoder().encode(html + css + js).length > 1_800_000) {
+    return c.json({ error: "Game code is too large for D1 storage" }, 413);
+  }
+
+  const id = crypto.randomUUID();
+  await c.env.DB.batch([
+    c.env.DB.prepare(
+      "INSERT INTO games (id, owner_id) VALUES (?, ?)"
+    ).bind(id, user.id),
+    c.env.DB.prepare(`
+      INSERT INTO game_versions (
+        game_id, version_number, status, title, description, color, html, css, js
+      ) VALUES (?, 1, 'pending', ?, ?, ?, ?, ?, ?)
+    `).bind(id, title.trim(), description, color, html, css, js),
+  ]);
+
+  return c.json({ id, status: "pending" }, 201);
 });
 
 // Export the Hono app

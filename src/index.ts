@@ -46,5 +46,29 @@ openapi.route("/tasks", tasksRouter);
 // Register other endpoints
 openapi.post("/dummy/:slug", DummyEndpoint);
 
+app.get("/api/games", async (c) => {
+    const result = await c.env.DB.prepare(`
+        SELECT
+            g.id,
+            g.owner_id AS author,
+            v.version_number,
+            v.title,
+            v.description,
+            v.color
+        FROM games AS g
+        JOIN game_versions AS v ON v.game_id = g.id
+        WHERE v.status = 'approved'
+            AND v.version_number = (
+                SELECT MAX(latest.version_number)
+                FROM game_versions AS latest
+                WHERE latest.game_id = g.id
+                    AND latest.status = 'approved'
+            )
+        ORDER BY v.created_at DESC
+    `).all();
+
+    return c.json({ games: result.results });
+});
+
 // Export the Hono app
 export default app;

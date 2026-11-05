@@ -6,6 +6,10 @@
 	"observability": {
 		"enabled": true
 	},
+	"vars": {
+    "SUPABASE_PUBLISHABLE_KEY": "sb_publishable_hGku3vvs1IlHqswTc3MvBg_gAkF-vOR",
+    "SUPABASE_URL": "https://gahjnjpockmwhozouyew.supabase.co"
+  	},
 	"d1_databases": [
 		{
 			"binding": "DB",

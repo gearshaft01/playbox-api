@@ -8,7 +8,8 @@
 	},
 	"vars": {
     "SUPABASE_PUBLISHABLE_KEY": "sb_publishable_hGku3vvs1IlHqswTc3MvBg_gAkF-vOR",
-    "SUPABASE_URL": "https://gahjnjpockmwhozouyew.supabase.co"
+    "SUPABASE_URL": "https://gahjnjpockmwhozouyew.supabase.co",
+	"MODERATOR_USER_ID": "2b77220f-97d7-4064-9e14-320500efb84d"
   	},
 	"d1_databases": [
 		{

@@ -123,7 +123,7 @@ app.use(
 			"https://playbox.gearshaft01.workers.dev",
 			"https://playbox-blond.vercel.app",
 		],
-		allowMethods: ["GET", "OPTIONS", "POST", "PUT"],
+		allowMethods: ["DELETE", "GET", "OPTIONS", "POST", "PUT"],
 		allowHeaders: ["Content-Type", "Authorization"],
 	}),
 );
@@ -172,7 +172,8 @@ app.get("/api/games", async (c) => {
 		FROM games AS g
 		JOIN game_versions AS v ON v.game_id = g.id
 		LEFT JOIN player_profiles AS p ON p.user_id = g.owner_id
-		WHERE v.status = 'approved'
+		WHERE g.visibility = 'public'
+			AND v.status = 'approved'
 			AND v.version_number = (
 				SELECT MAX(latest.version_number)
 				FROM game_versions AS latest
@@ -201,6 +202,7 @@ app.get("/api/games/:id", async (c) => {
 		JOIN game_versions AS v ON v.game_id = g.id
 		LEFT JOIN player_profiles AS p ON p.user_id = g.owner_id
 		WHERE g.id = ?
+			AND g.visibility = 'public'
 			AND v.status = 'approved'
 		ORDER BY v.version_number DESC
 		LIMIT 1
@@ -349,6 +351,183 @@ app.post("/api/games", async (c) => {
 	]);
 
 	return c.json({ id, status: "pending" }, 201);
+});
+
+app.get("/api/my/games", async (c) => {
+	const auth = await verifyUser(c.req.raw, c.env);
+	if (!auth.ok) return auth.response;
+
+	const result = await c.env.DB.prepare(`
+		SELECT
+			g.id,
+			g.visibility,
+			v.version_number,
+			v.status,
+			v.title,
+			v.description,
+			v.color,
+			v.html,
+			v.css,
+			v.js,
+			v.review_reason
+		FROM games AS g
+		JOIN game_versions AS v ON v.game_id = g.id
+		WHERE g.owner_id = ?
+			AND v.version_number = (
+				SELECT MAX(latest.version_number)
+				FROM game_versions AS latest
+				WHERE latest.game_id = g.id
+			)
+		ORDER BY v.created_at DESC
+	`).bind(auth.user.id).all();
+
+	return c.json({ games: result.results });
+});
+
+app.get("/api/my/games/:id/play", async (c) => {
+	const auth = await verifyUser(c.req.raw, c.env);
+	if (!auth.ok) return auth.response;
+
+	const game = await c.env.DB.prepare(`
+		SELECT
+			g.id,
+			COALESCE(p.username, 'Player') AS author,
+			v.version_number,
+			v.title,
+			v.description,
+			v.color,
+			v.html,
+			v.css,
+			v.js
+		FROM games AS g
+		JOIN game_versions AS v ON v.game_id = g.id
+		LEFT JOIN player_profiles AS p ON p.user_id = g.owner_id
+		WHERE g.id = ?
+			AND g.owner_id = ?
+			AND v.status = 'approved'
+		ORDER BY v.version_number DESC
+		LIMIT 1
+	`).bind(c.req.param("id"), auth.user.id).first();
+
+	if (!game) return c.json({ error: "Playable project not found" }, 404);
+	return c.json({ game });
+});
+
+app.post("/api/my/games/:id/versions", async (c) => {
+	const auth = await verifyUser(c.req.raw, c.env);
+	if (!auth.ok) return auth.response;
+
+	const ownedGame = await c.env.DB.prepare(
+		"SELECT id FROM games WHERE id = ? AND owner_id = ?",
+	).bind(c.req.param("id"), auth.user.id).first();
+	if (!ownedGame) return c.json({ error: "Project not found" }, 404);
+
+	const profile = await c.env.DB.prepare(
+		"SELECT username FROM player_profiles WHERE user_id = ?",
+	).bind(auth.user.id).first();
+	if (!profile) {
+		return c.json({ error: "Choose a public username before submitting" }, 400);
+	}
+
+	let body: unknown;
+	try {
+		body = await c.req.json();
+	} catch {
+		return c.json({ error: "Invalid JSON body" }, 400);
+	}
+
+	if (!body || typeof body !== "object" || Array.isArray(body)) {
+		return c.json({ error: "Invalid game data" }, 400);
+	}
+
+	const game = body as Record<string, unknown>;
+	const fields = ["title", "description", "color", "html", "css", "js"];
+	if (fields.some((field) => typeof game[field] !== "string")) {
+		return c.json({ error: "All game fields must be strings" }, 400);
+	}
+
+	const title = game.title as string;
+	const description = game.description as string;
+	const color = game.color as string;
+	const html = game.html as string;
+	const css = game.css as string;
+	const js = game.js as string;
+
+	if (!title.trim() || title.length > 100) {
+		return c.json({ error: "Title is required and must be at most 100 characters" }, 400);
+	}
+	if (description.length > 500) {
+		return c.json({ error: "Description must be at most 500 characters" }, 400);
+	}
+	if (!/^#[0-9a-f]{6}$/i.test(color)) {
+		return c.json({ error: "Invalid thumbnail color" }, 400);
+	}
+	if (new TextEncoder().encode(html + css + js).length > 1_800_000) {
+		return c.json({ error: "Game code is too large for D1 storage" }, 413);
+	}
+
+	await c.env.DB.prepare(`
+		INSERT INTO game_versions (
+			game_id, version_number, status, title, description, color, html, css, js
+		)
+		SELECT ?, COALESCE(MAX(version_number), 0) + 1, 'pending', ?, ?, ?, ?, ?, ?
+		FROM game_versions
+		WHERE game_id = ?
+	`).bind(
+		c.req.param("id"),
+		title.trim(),
+		description,
+		color,
+		html,
+		css,
+		js,
+		c.req.param("id"),
+	).run();
+
+	const version = await c.env.DB.prepare(
+		"SELECT MAX(version_number) AS version_number FROM game_versions WHERE game_id = ?",
+	).bind(c.req.param("id")).first<{ version_number: number }>();
+
+	return c.json({ status: "pending", version_number: version?.version_number }, 201);
+});
+
+app.put("/api/my/games/:id/visibility", async (c) => {
+	const auth = await verifyUser(c.req.raw, c.env);
+	if (!auth.ok) return auth.response;
+
+	let body: unknown;
+	try {
+		body = await c.req.json();
+	} catch {
+		return c.json({ error: "Invalid JSON body" }, 400);
+	}
+
+	if (!body || typeof body !== "object" || Array.isArray(body)) {
+		return c.json({ error: "Invalid visibility data" }, 400);
+	}
+	const visibility = (body as Record<string, unknown>).visibility;
+	if (visibility !== "public" && visibility !== "private") {
+		return c.json({ error: "Visibility must be public or private" }, 400);
+	}
+
+	const updated = await c.env.DB.prepare(
+		"UPDATE games SET visibility = ? WHERE id = ? AND owner_id = ?",
+	).bind(visibility, c.req.param("id"), auth.user.id).run();
+	if (updated.meta.changes === 0) return c.json({ error: "Project not found" }, 404);
+
+	return c.json({ id: c.req.param("id"), visibility });
+});
+
+app.delete("/api/my/games/:id", async (c) => {
+	const auth = await verifyUser(c.req.raw, c.env);
+	if (!auth.ok) return auth.response;
+
+	const deleted = await c.env.DB.prepare(
+		"DELETE FROM games WHERE id = ? AND owner_id = ?",
+	).bind(c.req.param("id"), auth.user.id).run();
+	if (deleted.meta.changes === 0) return c.json({ error: "Project not found" }, 404);
+
+	return c.json({ success: true });
 });
 
 app.get("/api/moderation/pending", async (c) => {
